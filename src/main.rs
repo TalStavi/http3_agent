@@ -1,7 +1,7 @@
 use quinn::{Endpoint, ClientConfig, ReadExactError, ConnectError};
 use rustls::{Certificate, RootCertStore};
 use serde_json::{json, Value};
-use rmp_serde::{to_vec, from_read};
+use rmp_serde::to_vec;
 use rmp_serde::encode::Error as RmpEncodeError;
 use std::net::SocketAddr;
 use rand::{thread_rng, Rng};
@@ -33,8 +33,6 @@ enum ClientError {
     Json(#[from] serde_json::Error),
     #[error("TLS error: {0}")]
     Tls(#[from] rustls::Error),
-    #[error("Invalid message length")]
-    InvalidMessageLength,
     #[error("Read exact error: {0}")]
     ReadExact(#[from] ReadExactError),
     #[error("Connect error: {0}")]
@@ -45,6 +43,8 @@ enum ClientError {
     PoolExhausted,
     #[error("Max retries exceeded")]
     MaxRetriesExceeded,
+    #[error("Unexpected server response")]
+    UnexpectedResponse,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -58,9 +58,9 @@ struct Args {
     debug: bool,
     #[clap(long)]
     stress_test: bool,
-    #[clap(long, default_value = "100")]
+    #[clap(long, default_value = "200")]
     concurrent_connections: usize,
-    #[clap(long, default_value = "100")]
+    #[clap(long, default_value = "50")]
     batch_size: usize,
     #[clap(long, default_value = "20")]
     stress_test_duration: u64,
@@ -224,36 +224,29 @@ async fn send_batch(
         println!("Sent batch of {} messages", args.batch_size);
     }
 
-    let response = read_length_prefixed_message(&mut recv).await?;
+    let response = read_ack(&mut recv).await?;
 
     let mut metrics = metrics.lock().await;
     metrics.requests_sent += 1;
     metrics.jsons_sent += args.batch_size;
     metrics.total_msgpack_size += batch_msgpack.len();
 
-    if response.is_empty() {
-        metrics.failed_responses += 1;
-        if args.debug {
-            println!("Received an empty response from the server.");
-        }
-    } else {
+    if response == "ACK" {
         metrics.successful_responses += 1;
         if args.debug {
-            match from_read::<_, Vec<serde_json::Value>>(&response[..]) {
-                Ok(response_json) => {
-                    println!("Received response: {}", serde_json::to_string_pretty(&response_json)?);
-                },
-                Err(e) => {
-                    println!("Error parsing MessagePack: {:?}", e);
-                }
-            }
+            println!("Received acknowledgment from server.");
+        }
+    } else {
+        metrics.failed_responses += 1;
+        if args.debug {
+            println!("Received unexpected response from server: {}", response);
         }
     }
 
     Ok(())
 }
 
-async fn run_single_request(endpoint: &Endpoint, server_addr: SocketAddr, args: &Args) -> Result<(), ClientError> {
+async fn run_single_request(endpoint: &Endpoint, server_addr: SocketAddr, _args: &Args) -> Result<(), ClientError> {
     let connection = endpoint.connect(server_addr, "localhost")?.await?;
     println!("Connected to {}", server_addr);
 
@@ -266,25 +259,12 @@ async fn run_single_request(endpoint: &Endpoint, server_addr: SocketAddr, args: 
 
     println!("Sent data: {}", serde_json::to_string_pretty(&data_to_send)?);
 
-    let response = read_length_prefixed_message(&mut recv).await?;
+    let response = read_ack(&mut recv).await?;
 
-    if args.debug {
-        println!("Raw response (hex): {:?}", response);
-    }
-
-    if response.is_empty() {
-        println!("Received an empty response from the server.");
-        return Ok(());
-    }
-
-    match from_read::<_, Vec<serde_json::Value>>(&response[..]) {
-        Ok(response_json) => {
-            println!("Received response: {}", serde_json::to_string_pretty(&response_json)?);
-        },
-        Err(e) => {
-            println!("Error parsing MessagePack: {:?}", e);
-            println!("This could be due to an incomplete or malformed response from the server.");
-        }
+    if response == "ACK" {
+        println!("Received acknowledgment from server.");
+    } else {
+        println!("Received unexpected response from server: {}", response);
     }
 
     Ok(())
@@ -321,18 +301,15 @@ async fn send_length_prefixed_message(send: &mut quinn::SendStream, data: &[u8])
     Ok(())
 }
 
-async fn read_length_prefixed_message(recv: &mut quinn::RecvStream) -> Result<Vec<u8>, ClientError> {
-    let mut length_bytes = [0u8; 4];
-    recv.read_exact(&mut length_bytes).await?;
-    let length = u32::from_be_bytes(length_bytes) as usize;
-
-    if length > 10_000_000 { // 10 MB limit, adjust as needed
-        return Err(ClientError::InvalidMessageLength);
-    }
-
-    let mut buf = vec![0u8; length];
+async fn read_ack(recv: &mut quinn::RecvStream) -> Result<String, ClientError> {
+    let mut buf = [0u8; 4]; // ACK is 3 bytes, but we read 4 to include the msgpack string header
     recv.read_exact(&mut buf).await?;
-    Ok(buf)
+    
+    if &buf[1..] == b"ACK" {
+        Ok("ACK".to_string())
+    } else {
+        Err(ClientError::UnexpectedResponse)
+    }
 }
 
 fn generate_fake_process_data() -> Value {
