@@ -1,5 +1,6 @@
-use quinn::{Endpoint, ClientConfig, ReadExactError, ConnectError};
-use rustls::{Certificate, RootCertStore};
+use quinn::{crypto::rustls::QuicClientConfig, ConnectError, Endpoint};
+use rustls::RootCertStore;
+use rustls::pki_types::CertificateDer;
 use serde_json::{json, Value};
 use rmp_serde::to_vec;
 use rmp_serde::encode::Error as RmpEncodeError;
@@ -10,10 +11,10 @@ use clap::Parser;
 use tokio::time::{Duration, Instant};
 use futures::future::join_all;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
 use bytes::{BytesMut, BufMut};
 use thiserror::Error;
 use std::net::AddrParseError;
+use tokio::sync::mpsc;
 
 #[derive(Error, Debug)]
 enum ClientError {
@@ -23,28 +24,18 @@ enum ClientError {
     QuinnConnection(#[from] quinn::ConnectionError),
     #[error("Quinn write error: {0}")]
     QuinnWrite(#[from] quinn::WriteError),
-    #[error("Quinn read error: {0}")]
-    QuinnRead(#[from] quinn::ReadError),
-    #[error("MessagePack decode error: {0}")]
-    MessagePackDecode(#[from] rmp_serde::decode::Error),
     #[error("MessagePack encode error: {0}")]
     MessagePackEncode(#[from] RmpEncodeError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("TLS error: {0}")]
     Tls(#[from] rustls::Error),
-    #[error("Read exact error: {0}")]
-    ReadExact(#[from] ReadExactError),
     #[error("Connect error: {0}")]
     Connect(#[from] ConnectError),
     #[error("Address parse error: {0}")]
     AddrParse(#[from] AddrParseError),
-    #[error("Connection pool exhausted")]
-    PoolExhausted,
     #[error("Max retries exceeded")]
     MaxRetriesExceeded,
-    #[error("Unexpected server response")]
-    UnexpectedResponse,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -60,7 +51,7 @@ struct Args {
     stress_test: bool,
     #[clap(long, default_value = "200")]
     concurrent_connections: usize,
-    #[clap(long, default_value = "50")]
+    #[clap(long, default_value = "5")]
     batch_size: usize,
     #[clap(long, default_value = "20")]
     stress_test_duration: u64,
@@ -70,19 +61,15 @@ struct Args {
     connection_pool_size: usize,
 }
 
-#[derive(Default)]
 struct StressTestMetrics {
     requests_sent: usize,
     jsons_sent: usize,
     total_msgpack_size: usize,
-    successful_responses: usize,
-    failed_responses: usize,
     errors: Vec<String>,
 }
 
 struct ConnectionPool {
     connections: Vec<quinn::Connection>,
-    semaphore: Arc<Semaphore>,
 }
 
 impl ConnectionPool {
@@ -92,28 +79,26 @@ impl ConnectionPool {
             let conn = endpoint.connect(server_addr, "localhost")?.await?;
             connections.push(conn);
         }
-        Ok(Self {
-            connections,
-            semaphore: Arc::new(Semaphore::new(size)),
-        })
+        Ok(Self { connections })
     }
 
-    async fn get_connection(&self) -> Result<quinn::Connection, ClientError> {
-        let _permit = self.semaphore.acquire().await.map_err(|_| ClientError::PoolExhausted)?;
-        Ok(self.connections[thread_rng().gen_range(0..self.connections.len())].clone())
+    fn get_connection(&self) -> quinn::Connection {
+        self.connections[thread_rng().gen_range(0..self.connections.len())].clone()
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), ClientError> {
     let args = Args::parse();
-
+    rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
     let cert = std::fs::read(&args.cert_path)?;
-    let cert = Certificate(cert);
+    let cert = CertificateDer::from(cert);
     let client_config = create_client_config(cert)?;
+    let client_config2 =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_config).unwrap()));
 
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_config);
+    endpoint.set_default_client_config(client_config2);
 
     let server_addr: SocketAddr = args.server_addr.parse().expect("Valid address");
 
@@ -131,42 +116,63 @@ async fn run_stress_test(endpoint: &Endpoint, server_addr: SocketAddr, args: Arg
     
     let start_time = Instant::now();
     let duration = Duration::from_secs(args.stress_test_duration);
-    let metrics = Arc::new(Mutex::new(StressTestMetrics::default()));
 
     let json_pool = Arc::new(generate_json_pool(args.json_pool_size));
 
     let pool = Arc::new(ConnectionPool::new(endpoint, server_addr, args.connection_pool_size).await?);
 
+    let (tx, mut rx) = mpsc::channel(args.concurrent_connections);
+
+    let collector_handle = tokio::spawn(async move {
+        let mut metrics = StressTestMetrics {
+            requests_sent: 0,
+            jsons_sent: 0,
+            total_msgpack_size: 0,
+            errors: Vec::new(),
+        };
+
+        while let Some(result) = rx.recv().await {
+            match result {
+                Ok((requests, jsons, size)) => {
+                    metrics.requests_sent += requests;
+                    metrics.jsons_sent += jsons;
+                    metrics.total_msgpack_size += size;
+                }
+                Err(e) => {
+                    metrics.errors.push(format!("Batch error: {:?}", e));
+                }
+            }
+        }
+
+        metrics
+    });
+
     let mut handles = Vec::new();
     for _ in 0..args.concurrent_connections {
-        let metrics_clone = Arc::clone(&metrics);
+        let tx = tx.clone();
         let args_clone = args.clone();
         let json_pool_clone = Arc::clone(&json_pool);
         let pool_clone = Arc::clone(&pool);
         handles.push(tokio::spawn(async move {
             while start_time.elapsed() < duration {
-                match send_batch_with_retry(&pool_clone, &metrics_clone, &args_clone, &json_pool_clone).await {
-                    Ok(_) => {},
-                    Err(e) => {
-                        let mut metrics = metrics_clone.lock().await;
-                        metrics.errors.push(format!("Batch error: {:?}", e));
-                    }
+                let result = send_batch_with_retry(&pool_clone, &args_clone, &json_pool_clone).await;
+                if tx.send(result).await.is_err() {
+                    break;
                 }
             }
         }));
     }
 
     join_all(handles).await;
+    drop(tx);
 
+    let metrics = collector_handle.await.unwrap();
     let elapsed = start_time.elapsed();
-    let metrics = metrics.lock().await;
     
     println!("Stress test completed in {:.2} seconds", elapsed.as_secs_f64());
     println!("Requests sent: {}", metrics.requests_sent);
     println!("JSONs sent: {}", metrics.jsons_sent);
     println!("Average msgpack size per batch: {:.2} bytes", metrics.total_msgpack_size as f64 / metrics.requests_sent as f64);
-    println!("Successful responses: {}", metrics.successful_responses);
-    println!("Failed responses: {}", metrics.failed_responses);
     println!("Requests per second: {:.2}", metrics.requests_sent as f64 / elapsed.as_secs_f64());
     println!("JSONs per second: {:.2}", metrics.jsons_sent as f64 / elapsed.as_secs_f64());
     println!("Errors encountered: {}", metrics.errors.len());
@@ -179,17 +185,16 @@ async fn run_stress_test(endpoint: &Endpoint, server_addr: SocketAddr, args: Arg
 
 async fn send_batch_with_retry(
     pool: &Arc<ConnectionPool>,
-    metrics: &Arc<Mutex<StressTestMetrics>>,
     args: &Args,
     json_pool: &[Value],
-) -> Result<(), ClientError> {
+) -> Result<(usize, usize, usize), ClientError> {
     const MAX_RETRIES: usize = 3;
     let mut retries = 0;
 
     while retries < MAX_RETRIES {
-        let connection = pool.get_connection().await?;
-        match send_batch(&connection, metrics, args, json_pool).await {
-            Ok(_) => return Ok(()),
+        let connection = pool.get_connection();
+        match send_batch(&connection, args, json_pool).await {
+            Ok(result) => return Ok(result),
             Err(ClientError::QuinnWrite(quinn::WriteError::Stopped(_))) => {
                 retries += 1;
                 if retries < MAX_RETRIES {
@@ -205,11 +210,10 @@ async fn send_batch_with_retry(
 
 async fn send_batch(
     connection: &quinn::Connection,
-    metrics: &Arc<Mutex<StressTestMetrics>>,
     args: &Args,
     json_pool: &[Value],
-) -> Result<(), ClientError> {
-    let (mut send, mut recv) = connection.open_bi().await?;
+) -> Result<(usize, usize, usize), ClientError> {
+    let mut send = connection.open_uni().await?;
 
     let mut batch = Vec::new();
     for _ in 0..args.batch_size {
@@ -224,33 +228,14 @@ async fn send_batch(
         println!("Sent batch of {} messages", args.batch_size);
     }
 
-    let response = read_ack(&mut recv).await?;
-
-    let mut metrics = metrics.lock().await;
-    metrics.requests_sent += 1;
-    metrics.jsons_sent += args.batch_size;
-    metrics.total_msgpack_size += batch_msgpack.len();
-
-    if response == "ACK" {
-        metrics.successful_responses += 1;
-        if args.debug {
-            println!("Received acknowledgment from server.");
-        }
-    } else {
-        metrics.failed_responses += 1;
-        if args.debug {
-            println!("Received unexpected response from server: {}", response);
-        }
-    }
-
-    Ok(())
+    Ok((1, args.batch_size, batch_msgpack.len()))
 }
 
-async fn run_single_request(endpoint: &Endpoint, server_addr: SocketAddr, _args: &Args) -> Result<(), ClientError> {
+async fn run_single_request(endpoint: &Endpoint, server_addr: SocketAddr, args: &Args) -> Result<(), ClientError> {
     let connection = endpoint.connect(server_addr, "localhost")?.await?;
     println!("Connected to {}", server_addr);
 
-    let (mut send, mut recv) = connection.open_bi().await?;
+    let mut send = connection.open_uni().await?;
 
     let process_data = generate_fake_process_data();
     let data_to_send = vec![process_data]; // Wrap in an array
@@ -259,24 +244,22 @@ async fn run_single_request(endpoint: &Endpoint, server_addr: SocketAddr, _args:
 
     println!("Sent data: {}", serde_json::to_string_pretty(&data_to_send)?);
 
-    let response = read_ack(&mut recv).await?;
-
-    if response == "ACK" {
-        println!("Received acknowledgment from server.");
-    } else {
-        println!("Received unexpected response from server: {}", response);
+    if args.debug {
+        println!("Data sent successfully. No acknowledgment expected.");
     }
 
     Ok(())
 }
 
-fn create_client_config(server_cert: Certificate) -> Result<ClientConfig, ClientError> {
+fn create_client_config(server_cert: CertificateDer) -> Result<rustls::ClientConfig, ClientError> {
     let mut roots = RootCertStore::empty();
-    roots.add(&server_cert)?;
+    roots.add(server_cert)?;
     
-    let client_config = ClientConfig::with_root_certificates(roots);
-    
-    Ok(client_config)
+    let client_crypto = rustls::ClientConfig::builder()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+
+    Ok(client_crypto)
 }
 
 fn generate_json_pool(pool_size: usize) -> Vec<Value> {
@@ -297,19 +280,8 @@ async fn send_length_prefixed_message(send: &mut quinn::SendStream, data: &[u8])
     message.put_slice(data);
 
     send.write_all(&message).await?;
-    send.finish().await?;
+    let _ = send.finish();
     Ok(())
-}
-
-async fn read_ack(recv: &mut quinn::RecvStream) -> Result<String, ClientError> {
-    let mut buf = [0u8; 4]; // ACK is 3 bytes, but we read 4 to include the msgpack string header
-    recv.read_exact(&mut buf).await?;
-    
-    if &buf[1..] == b"ACK" {
-        Ok("ACK".to_string())
-    } else {
-        Err(ClientError::UnexpectedResponse)
-    }
 }
 
 fn generate_fake_process_data() -> Value {
